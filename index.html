@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Scan Barcode - SembakoMart</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#10231a; color:#fff; min-height:100vh; display:flex; flex-direction:column; }
+  header { padding:14px; text-align:center; font-weight:700; font-size:18px; background:#17a463; }
+  #camWrap { position:relative; width:100%; max-width:480px; margin:12px auto 0; border-radius:16px; overflow:hidden; background:#000; aspect-ratio:4/3; }
+  #cam { width:100%; height:100%; object-fit:cover; }
+  /* Kotak penanda proporsi barcode (lebar): hanya isi kotak ini yang dibaca, jadi barcode cukup diposisikan di dalamnya. */
+  #frame { position:absolute; left:50%; top:50%; width:74%; aspect-ratio:2/1; transform:translate(-50%,-50%); border:3px solid rgba(255,255,255,.9); border-radius:10px; box-shadow:0 0 0 999px rgba(0,0,0,.45); pointer-events:none; transition:border-color .15s; }
+  #frame::after { content:''; position:absolute; left:6%; right:6%; top:50%; height:2px; background:rgba(255,60,60,.8); }
+  #frame.ok { border-color:#3ddc84; }
+  #frame.ok::after { background:#3ddc84; }
+  #status { text-align:center; padding:10px 20px; font-size:14px; color:#a9e8c8; min-height:20px; }
+  #hasil { margin:4px auto; max-width:480px; width:100%; padding:12px 16px; text-align:center; background:#1a3326; border-radius:12px; display:none; }
+  #hasil b { font-size:20px; word-break:break-all; }
+  .btn { display:inline-block; margin:5px; padding:11px 20px; border-radius:999px; background:#17a463; color:#fff; border:none; font-size:15px; font-weight:600; }
+  .btn-secondary { background:#27493a; }
+  .row { text-align:center; max-width:480px; margin:0 auto; }
+  #warn { max-width:480px; margin:24px auto; padding:16px; text-align:center; color:#f2b8b3; display:none; }
+  #gun { width:90%; max-width:420px; margin:6px auto; padding:10px 14px; border-radius:10px; border:1px solid #27493a; background:#1a3326; color:#fff; font-size:15px; display:block; }
+</style>
+</head>
+<body>
+<header>📷 Scan Barcode - SembakoMart</header>
+<div id="app">
+  <div id="camWrap"><video id="cam" playsinline muted></video><div id="frame"></div></div>
+  <div id="status">Menyalakan kamera...</div>
+  <div id="hasil"><div style="font-size:13px;color:#c4f0da">Terakhir terbaca (otomatis masuk ke Kasir):</div><b id="hasil-teks"></b></div>
+  <div class="row">
+    <button id="btn-torch" class="btn btn-secondary" style="display:none" onclick="toggleTorch()">🔦 Senter</button>
+    <button id="btn-kembali" class="btn" onclick="window.close()">⬅ Kembali ke Kasir</button>
+  </div>
+  <input id="gun" placeholder="Atau tembak pakai scanner Bluetooth/USB di sini" autocomplete="off">
+</div>
+<div id="warn">Halaman ini harus dibuka lewat tombol "Scan Barcode" di aplikasi Kasir POS (bukan dibuka langsung), supaya hasil scan bisa terkirim otomatis ke keranjang.</div>
+<canvas id="cv" style="display:none"></canvas>
+
+<script>
+  var $ = function (id) { return document.getElementById(id); };
+  var params = new URLSearchParams(location.search);
+  var remoteKode = params.get('kode'), remoteBase = params.get('base');
+  var isRemote = !!(remoteKode && remoteBase);
+  var stream = null, track = null, torchOn = false, scanning = false, lastCode = '', lastAt = 0, tickN = 0, busy = false;
+
+  // Detektor bawaan Chrome Android (cepat, 1D + 2D); kalau tidak ada: jsQR untuk QR + ZXing untuk barcode garis.
+  var FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'qr_code', 'data_matrix'];
+  var bd = null;
+  (async function () {
+    try {
+      if ('BarcodeDetector' in window) {
+        var sup = await BarcodeDetector.getSupportedFormats();
+        var f = FORMATS.filter(function (x) { return sup.indexOf(x) >= 0; });
+        if (f.length) bd = new BarcodeDetector({ formats: f });
+      }
+    } catch (e) { bd = null; }
+  })();
+
+  var zxP = null, zxReader = null;
+  function loadZx() {
+    if (window.ZXing) return Promise.resolve(true);
+    if (!zxP) zxP = new Promise(function (res) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+      s.onload = function () { res(!!window.ZXing); };
+      s.onerror = function () { zxP = null; res(false); };
+      document.head.appendChild(s);
+    });
+    return zxP;
+  }
+  function zxDecode(c) {
+    if (!window.ZXing) return '';
+    try {
+      if (!zxReader) {
+        zxReader = new ZXing.MultiFormatReader();
+        var h = new Map();
+        h.set(ZXing.DecodeHintType.TRY_HARDER, true);
+        zxReader.setHints(h);
+      }
+      return zxReader.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(c)))).getText();
+    } catch (e) { return ''; }
+  }
+
+  async function decode(src, w, h, maxDim, crop) {
+    var sx = 0, sy = 0, sw = w, sh = h;
+    if (crop) { sx = crop.x; sy = crop.y; sw = crop.w; sh = crop.h; }
+    var scale = Math.min(1, maxDim / Math.max(sw, sh));
+    var c = $('cv'); c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+    var ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    var t = '';
+    if (bd) { try { var r = await bd.detect(c); if (r.length) t = r[0].rawValue; } catch (e) {} }
+    if (!t) { var img = ctx.getImageData(0, 0, c.width, c.height); var q = jsQR(img.data, c.width, c.height, { inversionAttempts: 'dontInvert' }); if (q && q.data) t = q.data; }
+    if (!t && !bd) { await loadZx(); t = zxDecode(c); }
+    return String(t || '').trim();
+  }
+
+  function kirimHasil_(kode) {
+    if (isRemote) {
+      // Image beacon: GET tetap terkirim walau respons bukan gambar, kebal CORS antar origin.
+      var url = remoteBase + (remoteBase.indexOf('?') === -1 ? '?' : '&') +
+        'page=api&action=kirimScan&kode=' + encodeURIComponent(remoteKode) + '&barcode=' + encodeURIComponent(kode);
+      new Image().src = url;
+    } else if (window.opener) {
+      window.opener.postMessage({ source: 'kasir-scanner', code: kode }, '*');
+    }
+  }
+
+  // Scan terus-menerus: kode yang sama diabaikan 2 detik supaya tidak masuk dobel.
+  function onDecoded(kode) {
+    var now = Date.now();
+    if (kode === lastCode && now - lastAt < 2000) { lastAt = now; return; }
+    lastCode = kode; lastAt = now;
+    if (navigator.vibrate) navigator.vibrate(80);
+    kirimHasil_(kode);
+    $('hasil').style.display = 'block'; $('hasil-teks').textContent = kode;
+    $('status').textContent = '✅ Terbaca. Langsung arahkan ke produk berikutnya (tidak perlu pindah halaman)...';
+    var fr = $('frame'); fr.classList.add('ok'); setTimeout(function () { fr.classList.remove('ok'); }, 600);
+  }
+
+  async function startCam() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('status').textContent = 'Browser tidak mendukung kamera. Pakai scanner Bluetooth/USB.'; return; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    } catch (e) { $('status').textContent = 'Kamera tidak bisa dibuka (' + (e && e.name ? e.name : e) + '). Izinkan kamera, atau pakai scanner Bluetooth/USB.'; return; }
+    var v = $('cam'); v.srcObject = stream; await v.play().catch(function () {});
+    track = stream.getVideoTracks()[0];
+    try { var caps = track.getCapabilities(); if (caps.torch) $('btn-torch').style.display = 'inline-block'; if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(function () {}); } catch (e) {}
+    $('status').textContent = 'Posisikan barcode di dalam kotak. Scan berjalan terus, bisa langsung produk berikutnya.';
+    scanning = true; requestAnimationFrame(tick);
+  }
+  function toggleTorch() { torchOn = !torchOn; track.applyConstraints({ advanced: [{ torch: torchOn }] }).catch(function () {}); }
+
+  // Area kotak penanda (#frame) dalam koordinat piksel video (video ditampilkan object-fit: cover), ditambah sedikit toleransi.
+  function frameRect_() {
+    var v = $('cam'), vw = v.videoWidth, vh = v.videoHeight;
+    var cw = $('camWrap').clientWidth, ch = $('camWrap').clientHeight, f = $('frame');
+    if (!vw || !cw || !ch) return null;
+    var sc = Math.max(cw / vw, ch / vh), ox = (vw * sc - cw) / 2, oy = (vh * sc - ch) / 2;
+    var fl = f.offsetLeft - f.offsetWidth / 2, ft = f.offsetTop - f.offsetHeight / 2; // offsetLeft/Top = titik tengah (translate -50%)
+    var x = (fl + ox) / sc, y = (ft + oy) / sc, w = f.offsetWidth / sc, h = f.offsetHeight / sc;
+    var padX = w * 0.08, padY = h * 0.15;
+    x = Math.max(0, x - padX); y = Math.max(0, y - padY);
+    w = Math.min(vw - x, w + padX * 2); h = Math.min(vh - y, h + padY * 2);
+    return w > 20 && h > 20 ? { x: x, y: y, w: w, h: h } : null;
+  }
+
+  var lastTick = 0;
+  async function tick(ts) {
+    if (!scanning) return;
+    requestAnimationFrame(tick);
+    if (busy || ts - lastTick < 120) return;
+    lastTick = ts;
+    var v = $('cam');
+    if (v.readyState < 2 || !v.videoWidth) return;
+    busy = true;
+    try {
+      ++tickN;
+      var crop = frameRect_(), t = '';
+      // Utamakan isi kotak (cepat & fokus); tiap 4 putaran coba seluruh gambar sebagai cadangan.
+      if (crop) t = await decode(v, v.videoWidth, v.videoHeight, 1100, crop);
+      if (!t && (!crop || tickN % 4 === 0)) t = await decode(v, v.videoWidth, v.videoHeight, 1280);
+      if (t) onDecoded(t);
+    } finally { busy = false; }
+  }
+
+  // Scanner gun / Bluetooth / USB: ketikan cepat + Enter, ditangkap di mana pun fokusnya.
+  var wBuf = '', wAt = 0, wTimer = null;
+  document.addEventListener('keydown', function (ev) {
+    var now = Date.now();
+    if (now - wAt > 100) wBuf = '';
+    wAt = now; clearTimeout(wTimer);
+    var ketik = ev.key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey;
+    if (ev.key === 'Enter' || ev.key === 'Tab') {
+      var v = wBuf.length >= 4 ? wBuf : (ev.target === $('gun') ? $('gun').value : '');
+      wBuf = '';
+      if (v.trim()) { ev.preventDefault(); $('gun').value = ''; onDecoded(v.trim()); }
+    } else if (ketik) {
+      wBuf += ev.key;
+      wTimer = setTimeout(function () { if (wBuf.length >= 6) { var x = wBuf; wBuf = ''; $('gun').value = ''; onDecoded(x); } }, 300);
+    }
+  }, true);
+
+  if (!isRemote && !window.opener) {
+    $('app').style.display = 'none'; $('warn').style.display = 'block';
+  } else {
+    if (isRemote) $('btn-kembali').style.display = 'none';
+    startCam();
+  }
+</script>
+</body>
+</html>
